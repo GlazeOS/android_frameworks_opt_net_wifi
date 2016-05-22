@@ -94,6 +94,7 @@ import android.telephony.TelephonyManager;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.SparseArray;
+import android.os.SystemProperties;
 
 import com.android.internal.R;
 import com.android.internal.annotations.GuardedBy;
@@ -218,6 +219,8 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
     private final boolean mBackgroundScanSupported;
 
     private final String mInterfaceName;
+    /* The interface for ipManager */
+    private String mDataInterfaceName;
     /* Tethering interface could be separate from wlan interface */
     private String mTetherInterfaceName;
 
@@ -527,7 +530,7 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
         }
     }
 
-    private final IpManager mIpManager;
+    private IpManager mIpManager;
 
     private AlarmManager mAlarmManager;
     private PendingIntent mScanIntent;
@@ -1017,6 +1020,9 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
         // TODO refactor WifiNative use of context out into it's own class
         mWifiNative.initContext(mContext);
         mInterfaceName = mWifiNative.getInterfaceName();
+
+        updateDataInterface();
+
         mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_WIFI, 0, NETWORKTYPE, "");
         mBatteryStats = IBatteryStats.Stub.asInterface(mFacade.getService(
                 BatteryStats.SERVICE_NAME));
@@ -1057,7 +1063,7 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
         mLastNetworkId = WifiConfiguration.INVALID_NETWORK_ID;
         mLastSignalLevel = -1;
 
-        mIpManager = mFacade.makeIpManager(mContext, mInterfaceName, new IpManagerCallback());
+        mIpManager = mFacade.makeIpManager(mContext, mDataInterfaceName, new IpManagerCallback());
         mIpManager.setMulticastFilter(true);
 
         mAlarmManager = (AlarmManager) mContext.getSystemService(Context.ALARM_SERVICE);
@@ -1398,6 +1404,32 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
         return mWifiConfigManager.getEnableAutoJoinWhenAssociated();
     }
 
+    private void updateDataInterface() {
+        String defaultRateUpgradeInterfaceName = "bond0"; // interface used for fst
+        int fstEnabled = SystemProperties.getInt("persist.fst.rate.upgrade.en", 0);
+        String prevDataInterfaceName = mDataInterfaceName;
+        String rateUpgradeDataInterfaceName = SystemProperties.get("persist.fst.data.interface",
+                defaultRateUpgradeInterfaceName);
+
+        // When fst is not enabled, data interface is the same as the wlan interface
+        mDataInterfaceName = (fstEnabled == 1) ? rateUpgradeDataInterfaceName : mInterfaceName;
+
+        // as long as we did not change from fst enabled to disabled state
+        // and vise-versa data interface does not change
+        if (mDataInterfaceName.equals(prevDataInterfaceName)) {
+            return;
+        }
+
+        logd("fst " + ((fstEnabled == 1) ? "enabled" : "disabled"));
+
+        if (mIpManager != null) {
+            mIpManager.shutdown();
+            mIpManager = mFacade.makeIpManager(mContext, mDataInterfaceName,
+                                               new IpManagerCallback());
+            mIpManager.setMulticastFilter(true);
+        }
+    }
+
     private boolean setRandomMacOui() {
         String oui = mContext.getResources().getString(R.string.config_wifi_random_mac_oui);
         if (TextUtils.isEmpty(oui)) {
@@ -1574,8 +1606,8 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
             }
         }
         if (stats == null || mWifiLinkLayerStatsSupported <= 0) {
-            long mTxPkts = mFacade.getTxPackets(mInterfaceName);
-            long mRxPkts = mFacade.getRxPackets(mInterfaceName);
+            long mTxPkts = mFacade.getTxPackets(mDataInterfaceName);
+            long mRxPkts = mFacade.getRxPackets(mDataInterfaceName);
             mWifiInfo.updatePacketRates(mTxPkts, mRxPkts);
         } else {
             mWifiInfo.updatePacketRates(stats);
@@ -4322,16 +4354,16 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
                             // Ensure interface is down and we have no IP
                             // addresses before a supplicant start.
                             mNwService.setInterfaceDown(mInterfaceName);
-                            mNwService.clearInterfaceAddresses(mInterfaceName);
+                            mNwService.clearInterfaceAddresses(mDataInterfaceName);
 
                             // Set privacy extensions
-                            mNwService.setInterfaceIpv6PrivacyExtensions(mInterfaceName, true);
+                            mNwService.setInterfaceIpv6PrivacyExtensions(mDataInterfaceName, true);
 
                             // IPv6 is enabled only as long as access point is connected since:
                             // - IPv6 addresses and routes stick around after disconnection
                             // - kernel is unaware when connected and fails to start IPv6 negotiation
                             // - kernel can start autoconfiguration when 802.1x is not complete
-                            mNwService.disableIpv6(mInterfaceName);
+                            mNwService.disableIpv6(mDataInterfaceName);
                         } catch (RemoteException re) {
                             loge("Unable to change interface settings: " + re);
                         } catch (IllegalStateException ie) {
@@ -4348,6 +4380,8 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiRss
                             /* starting HAL is optional */
                             loge("Failed to start HAL");
                         }
+
+                        updateDataInterface();
 
                         if (mWifiNative.startSupplicant(mP2pSupported)) {
                             setSupplicantLogLevel();
